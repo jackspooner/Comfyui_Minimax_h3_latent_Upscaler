@@ -25,11 +25,8 @@ from einops import rearrange
 from enum import Enum
 from typing import TypedDict
 
-try:
-    import comfy.model_management as mm
-    HAS_COMFY_MM = True
-except ImportError:
-    HAS_COMFY_MM = False
+import comfy.model_management as mm
+from comfy.model_patcher import CoreModelPatcher
 
 try:
     from comfy_api.latest import ComfyExtension, io
@@ -116,9 +113,9 @@ def _resolve_device(backend):
             raise RuntimeError("ROCm was selected, but this PyTorch build has no HIP/ROCm support.")
         if not torch.cuda.is_available():
             raise RuntimeError("ROCm was selected, but PyTorch cannot access an AMD GPU.")
-        return torch.device("cuda")
+        return mm.get_torch_device()
     if backend == "cuda":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return mm.get_torch_device() if torch.cuda.is_available() else torch.device("cpu")
     raise ValueError(f"Unsupported device backend: {backend}")
 
 def _backend_label(device):
@@ -416,10 +413,9 @@ def _detect_arch(sd):
 
 def load_model(name, device, precision):
     backend_lbl = _backend_label(device)
-    cache_key = f"{name}::{backend_lbl}::{precision}"
+    cache_key = (name, str(device), precision)
     if cache_key in MODEL_CACHE:
-        model = MODEL_CACHE[cache_key]
-        return model.to(device, non_blocking=True)
+        return MODEL_CACHE[cache_key]
 
     try:
         path = folder_paths.get_full_path_or_raise(_LATENT_UPSCALE_FOLDER, name)
@@ -437,17 +433,28 @@ def load_model(name, device, precision):
     )
     model.load_state_dict(up_sd, strict=True)
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(precision, torch.float32)
-    model = model.to(device).eval().requires_grad_(False)
-    if dtype != torch.float32:
-        model = model.to(dtype)
-
-    MODEL_CACHE[cache_key] = model
+    model = model.to(dtype=dtype).eval().requires_grad_(False)
+    patcher = CoreModelPatcher(model, load_device=device, offload_device=mm.unet_offload_device())
+    MODEL_CACHE[cache_key] = patcher
     print(f"[MinimaxH3-3D] Loaded upscale model: {name}")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,} | "
           f"Attn: forced off | Temporal: {'on' if cfg['temporal_every'] > 0 else 'off'} "
           f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']}) | "
           f"Backend: {backend_lbl} | Precision: {precision}")
-    return model
+    return patcher
+
+
+def _workspace_memory(model, shape, target_size, dtype, enable_chunking):
+    b, c, t, h, w = shape
+    kernel = max((block.dwconv.kernel_size[0] for block in model.in_blocks
+                  if isinstance(block, TemporalConv)), default=0)
+    # Chunk overlap is applied twice on each side by forward(). Full input and
+    # output buffers still live for the whole clip.
+    active_t = min(t + 2 * kernel, 32 + 4 * kernel) if enable_chunking and t > 32 else t
+    spatial = max(h * w, target_size[1] * target_size[2])
+    features = 6 * b * model.conv_in.out_channels * active_t * spatial
+    buffers = 4 * b * c * (t + 2 * kernel) * spatial
+    return (features + buffers) * torch.empty((), dtype=dtype).element_size()
 
 # ==========================================
 # ComfyUI node (new API)
@@ -502,8 +509,8 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                 io.Boolean.Input("enable_temporal_chunking", default=True,
                                  tooltip="Enable temporal chunking to save VRAM for long videos and fix end-frame flickering."),
                 io.Boolean.Input("force_unload", default=True,
-                                 tooltip="Unload model to CPU after inference to free VRAM for subsequent nodes. "
-                                         "Disable if you run this node repeatedly to avoid reload overhead."),
+                                 tooltip="Ask ComfyUI to unload this model after inference, including on failure. "
+                                         "When disabled, ComfyUI can still evict it to make room for other models."),
 
                 # ---- 硬件 / 精度选项组 ----
                 io.Combo.Input("device", options=["cuda", "rocm", "cpu"], default="cuda"),
@@ -530,11 +537,8 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         dev = _resolve_device(device)
         compute_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
 
-        s = src.to(device=dev, dtype=compute_dtype, copy=True)
-        if was_4d:
-            s = s.unsqueeze(2)
-
-        b, c, t, h_in, w_in = s.shape
+        shape = src.unsqueeze(2).shape if was_4d else src.shape
+        b, c, t, h_in, w_in = shape
         downsample = VAE_DOWNSAMPLE
 
         # 1. Calculate Target Size
@@ -577,35 +581,32 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         print(f"[MinimaxH3-3D] Latent {w_in}x{h_in} -> {w_out}x{h_out} | "
               f"Pixels {w_out * downsample}x{h_out * downsample} | scale={effective_scale:.3f}")
 
-        # 3. Inference
-        model = load_model(model_name, dev, precision)
-        norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
+        # Reserve workspace before copying any input to the accelerator. The
+        # patcher lets ComfyUI evict the H3 sampler or this upscaler as needed.
+        patcher = load_model(model_name, dev, precision)
+        memory_required = _workspace_memory(
+            patcher.model, shape, (t, h_out, w_out), compute_dtype, enable_temporal_chunking)
+        try:
+            mm.load_models_gpu([patcher], memory_required=memory_required, force_full_load=True)
+            s = src.to(device=dev, dtype=compute_dtype, copy=True)
+            if was_4d:
+                s = s.unsqueeze(2)
+            norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
 
-        with torch.inference_mode():
-            s_norm = (s - norm_mean) / norm_std
-            del s
+            with torch.inference_mode():
+                s_norm = (s - norm_mean) / norm_std
+                del s
+                out = patcher.model(s_norm, scale=effective_scale, target_size=(t, h_out, w_out),
+                                    enable_chunking=enable_temporal_chunking)
+                del s_norm
+                out = out * norm_std + norm_mean
 
-            out = model(s_norm, scale=effective_scale, target_size=(t, h_out, w_out),
-                        enable_chunking=enable_temporal_chunking)
-
-            del s_norm
-            out = out * norm_std + norm_mean
-
-        if was_4d:
-            out = out.squeeze(2)
-
-        out = out.to(device="cpu", dtype=orig_dtype, non_blocking=True)
-
-        # 4. VRAM Management
-        if dev.type == "cuda":
+            if was_4d:
+                out = out.squeeze(2)
+            out = out.to(device="cpu", dtype=orig_dtype)
+        finally:
             if force_unload:
-                model.to("cpu", non_blocking=True)
-                print("[MinimaxH3-3D] ✅ Model offloaded to CPU. VRAM released.")
-            if HAS_COMFY_MM:
-                mm.soft_empty_cache()
-            else:
-                torch.cuda.empty_cache()
-            gc.collect()
+                mm.unload_model_and_clones(patcher, unload_additional_models=False)
 
         return io.NodeOutput({"samples": out})
 

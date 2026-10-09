@@ -349,3 +349,44 @@ This node follows the neural-latent-upscaling approach pioneered by
 (https://github.com/Ttl). The model architecture also draws on and references the
 **LTX 2.3 Spatial Upscaler** (`ltx-2.3-spatial-upscaler-x2-1.1.safetensors`).
 Thanks to both projects for the open-source foundation this work builds upon.
+
+## Worktree development
+
+Run `COMFYUI_PYTHON=/path/to/prepared/comfyui/python python3 scripts/setup_worktree.py` before editing. The configured Python must be >=3.10 with PyTorch, einops and safetensors installed from the ComfyUI deployment's requirements. The check reuses that explicit runtime without copying dependencies, installing packages, loading models or connecting to a service. It is safe to rerun and leaves tracked files unchanged. GPU validation requires a compatible GPU/runtime and separately provisioned model files; unit tests use isolated fixtures.
+
+## Local fork: managed 3D model memory
+
+Based on [LBH-123-AI's upstream project](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+and [upstream README](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler/blob/main/README.md).
+Upstream provides learned H3 latent resizing, 2D/3D networks, temporal chunking,
+normalization and pixel alignment. The documentation above describes those
+upstream capabilities; original credit and license remain intact.
+
+This fork changes the **3D** node's memory lifecycle. It builds weights on CPU in
+the selected precision, wraps them in ComfyUI's `CoreModelPatcher`, and asks
+`load_models_gpu` to reserve estimated activation space before copying input.
+Cached patchers remain evictable by ComfyUI. `force_unload=true` asks the manager
+to unload this patcher on success or failure; false allows managed residency.
+The 2D node and Plus fork are unchanged. Existing node IDs, inputs, checkpoint
+formats, normalization, temporal chunking and audio/video graph wiring remain
+compatible. No checkpoint conversion is required.
+
+Install this fork as the active original node package and restart an idle
+ComfyUI instance. Do not activate the original and Plus packages together because
+their node IDs overlap. This version requires ComfyUI APIs `CoreModelPatcher`,
+`load_models_gpu` and `unload_model_and_clones`; the tested base is ComfyUI 0.39.0.
+Memory estimates are conservative heuristics, not a guarantee that a full-size H3
+refinement will fit. Temporal chunking reduces upscaler activations only. A
+`HostBuffer.truncate failed` error in H3 refinement needs separate core pinned
+memory/prefetch recovery; this node alone cannot repair stale process state.
+
+Run CPU regression checks without models or GPU work:
+
+```bash
+PYTHONPATH=/path/to/ComfyUI OMP_NUM_THREADS=1 "$COMFYUI_PYTHON" -m pytest --confcutdir=tests -q tests
+```
+
+The configured interpreter needs pytest and ComfyUI's installed requirements in
+addition to setup prerequisites. Tests use temporary small checkpoints and cover
+unchanged numerical output, managed reuse, no-op input, and failure cleanup.
+Live CUDA acceptance must be checked separately after idle-service activation.
