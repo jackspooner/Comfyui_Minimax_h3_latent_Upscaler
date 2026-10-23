@@ -390,3 +390,5 @@ The configured interpreter needs pytest and ComfyUI's installed requirements in
 addition to setup prerequisites. Tests use temporary small checkpoints and cover
 unchanged numerical output, managed reuse, no-op input, and failure cleanup.
 Live CUDA acceptance must be checked separately after idle-service activation.
+
+Prepared-runtime setup and CPU verification commands are maintained in [AGENTS.md](AGENTS.md). These checks do not establish full checkpoint inference readiness.
